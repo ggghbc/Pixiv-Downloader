@@ -1,0 +1,15 @@
+downloads/
+build/
+build-*/
+dist/
+*.exe
+*.o
+*.a
+*.so
+*.dylib
+*.db
+*.db-wal
+*.db-shm
+*.part
+.vscode/
+.idea/

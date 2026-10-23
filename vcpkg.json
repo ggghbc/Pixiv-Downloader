@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "pixiv-downloader",
+  "version-string": "1.0.0",
+  "description": "Multi-threaded Pixiv artwork scraper",
+  "dependencies": [
+    "curl",
+    "sqlite3",
+    "libzip",
+    "cli11",
+    "nlohmann-json"
+  ]
+}
