@@ -338,13 +338,22 @@ private:
 // ============================================================================
 // File Metadata / Property Helper
 // ============================================================================
-void set_file_properties(const fs::path& file_path, const std::vector<std::string>& tags, const std::string& title = "") {
+void set_file_properties(const fs::path& file_path, const std::vector<std::string>& tags, const std::string& title = "", const std::string& author = "") {
 #ifdef _WIN32
-    if (tags.empty() && title.empty()) return;
+    if (tags.empty() && title.empty() && author.empty()) return;
 
-    std::wstring wpath = file_path.wstring();
+    // SHGetPropertyStoreFromParsingName strictly requires an absolute canonical path.
+    // Relative paths (e.g. ./downloads/...) cause ERROR_FILE_NOT_FOUND (0x80070002).
+    fs::path abs_path = fs::absolute(file_path);
+    std::wstring wpath = abs_path.wstring();
+
     IPropertyStore* pStore = nullptr;
-    HRESULT hr = SHGetPropertyStoreFromParsingName(wpath.c_str(), NULL, GPS_READWRITE, IID_PPV_ARGS(&pStore));
+    HRESULT hr = E_FAIL;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        hr = SHGetPropertyStoreFromParsingName(wpath.c_str(), NULL, GPS_READWRITE, IID_PPV_ARGS(&pStore));
+        if (SUCCEEDED(hr) && pStore) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     if (FAILED(hr) || !pStore) return;
 
     if (!tags.empty()) {
@@ -398,12 +407,35 @@ void set_file_properties(const fs::path& file_path, const std::vector<std::strin
         }
     }
 
+    if (!author.empty()) {
+        int size = MultiByteToWideChar(CP_UTF8, 0, author.c_str(), static_cast<int>(author.size()), NULL, 0);
+        if (size > 0) {
+            std::wstring wauthor(size, 0);
+            MultiByteToWideChar(CP_UTF8, 0, author.c_str(), static_cast<int>(author.size()), &wauthor[0], size);
+            PROPVARIANT pvAuthor;
+            PropVariantInit(&pvAuthor);
+            pvAuthor.vt = VT_VECTOR | VT_LPWSTR;
+            pvAuthor.calpwstr.cElems = 1;
+            pvAuthor.calpwstr.pElems = static_cast<LPWSTR*>(CoTaskMemAlloc(sizeof(LPWSTR)));
+            if (pvAuthor.calpwstr.pElems) {
+                size_t len = wauthor.size() + 1;
+                pvAuthor.calpwstr.pElems[0] = static_cast<LPWSTR>(CoTaskMemAlloc(len * sizeof(wchar_t)));
+                if (pvAuthor.calpwstr.pElems[0]) {
+                    wcscpy(pvAuthor.calpwstr.pElems[0], wauthor.c_str());
+                    pStore->SetValue(PKEY_Author, pvAuthor);
+                }
+                PropVariantClear(&pvAuthor);
+            }
+        }
+    }
+
     pStore->Commit();
     pStore->Release();
 #else
     (void)file_path;
     (void)tags;
     (void)title;
+    (void)author;
 #endif
 }
 
@@ -450,6 +482,7 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
 
         const auto& b = j["body"];
         std::string title = b.value("title", b.value("illustTitle", ""));
+        std::string author = b.value("userName", "");
         int illust_type = b.value("illustType", 0);
         int page_count = b.value("pageCount", 1);
 
@@ -521,7 +554,7 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
                 return;
             }
 
-            set_file_properties(gif_path, tags, title);
+            set_file_properties(gif_path, tags, title, author);
 
             db.mark_processed(illust_id, 200);
             log_msg("[+] [Ugoira] ID " + std::to_string(illust_id) + " saved (ZIP + GIF in " + std::to_string(illust_id) + "/)");
@@ -576,7 +609,7 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
 
             fs::path dest_file = cfg.output_dir / (std::to_string(illust_id) + ext);
             if (client.download_file(url, dest_file)) {
-                set_file_properties(dest_file, tags, title);
+                set_file_properties(dest_file, tags, title, author);
                 db.mark_processed(illust_id, 200);
                 log_msg("[+] ID " + std::to_string(illust_id) + " downloaded (" + dest_file.filename().string() + ")");
             } else {
@@ -592,7 +625,7 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
                     all_ok = false;
                     break;
                 }
-                set_file_properties(dest_file, tags, title);
+                set_file_properties(dest_file, tags, title, author);
             }
 
             if (all_ok) {
