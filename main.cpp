@@ -320,33 +320,41 @@ public:
         if (!proxies_.empty()) current_proxy_ = proxies_.next();
     }
 
-    long get_json(const std::string& url, std::string& response_body) {
+    long get_json(const std::string& url, std::string& response_body, bool fresh_connect = false) {
         response_body.clear();
-        setup_request(url);
+        setup_request(url, fresh_connect);
         curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, write_mem_cb);
         curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &response_body);
 
-        if (curl_easy_perform(curl_) != CURLE_OK) {
+        CURLcode res = curl_easy_perform(curl_);
+        if (res != CURLE_OK) {
+            last_error_ = curl_easy_strerror(res);
             rotate_proxy();
             return -1;
         }
         long http_code = 0;
         curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &http_code);
+        if (http_code == 0) {
+            last_error_ = "No HTTP response / connection dropped";
+            return -1;
+        }
         return http_code;
     }
 
     long get_json_with_retry(const std::string& url, std::string& response_body, int max_retries = 3) {
         long last_http_code = -1;
+        bool force_fresh = false;
         for (int attempt = 0; attempt <= max_retries; ++attempt) {
             wait_if_in_cooldown();
 
-            last_http_code = get_json(url, response_body);
+            last_http_code = get_json(url, response_body, force_fresh);
 
             if (last_http_code == 200 || last_http_code == 404) {
                 return last_http_code;
             }
 
             if (last_http_code == 429) {
+                force_fresh = false;
                 if (proxies_.size() > 1 && attempt < 2) {
                     rotate_proxy();
                     std::this_thread::sleep_for(std::chrono::milliseconds(400 * (attempt + 1)));
@@ -358,9 +366,12 @@ public:
                 continue;
             }
 
+            // Transport / network error (-1) or transient 5xx server error
             if (attempt < max_retries) {
+                force_fresh = true; // Drop stale keep-alive connection and establish fresh socket
                 rotate_proxy();
-                std::this_thread::sleep_for(std::chrono::milliseconds(500 * (attempt + 1)));
+                int sleep_ms = (last_http_code == -1) ? 1000 * (attempt + 1) : 500 * (attempt + 1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
             }
         }
         return last_http_code;
@@ -374,13 +385,14 @@ public:
         fs::path temp_path = dest_path;
         temp_path += ".part";
 
+        bool force_fresh = false;
         for (int attempt = 0; attempt <= max_retries; ++attempt) {
             wait_if_in_cooldown();
 
             FILE* fp = fopen(temp_path.string().c_str(), "wb");
             if (!fp) return false;
 
-            setup_request(url);
+            setup_request(url, force_fresh);
             curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, write_file_cb);
             curl_easy_setopt(curl_, CURLOPT_WRITEDATA, fp);
 
@@ -399,7 +411,14 @@ public:
             std::error_code ec;
             fs::remove(temp_path, ec);
 
+            if (res != CURLE_OK) {
+                last_error_ = curl_easy_strerror(res);
+            } else if (http_code != 200) {
+                last_error_ = "HTTP " + std::to_string(http_code);
+            }
+
             if (http_code == 429) {
+                force_fresh = false;
                 if (proxies_.size() > 1 && attempt < 2) {
                     rotate_proxy();
                     std::this_thread::sleep_for(std::chrono::milliseconds(400 * (attempt + 1)));
@@ -412,25 +431,33 @@ public:
             }
 
             if (attempt < max_retries) {
+                force_fresh = true;
                 rotate_proxy();
-                std::this_thread::sleep_for(std::chrono::milliseconds(500 * (attempt + 1)));
+                int sleep_ms = (res != CURLE_OK) ? 1000 * (attempt + 1) : 500 * (attempt + 1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
             }
         }
 
         return false;
     }
 
+    const std::string& last_error() const { return last_error_; }
+
 private:
-    void setup_request(const std::string& url) {
+    void setup_request(const std::string& url, bool fresh_connect = false) {
         // curl_easy_reset resets options but preserves live connections, DNS cache, and SSL sessions
         curl_easy_reset(curl_);
         curl_easy_setopt(curl_, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers_);
         curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT, 15L);
-        curl_easy_setopt(curl_, CURLOPT_TIMEOUT, 60L);
+        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(curl_, CURLOPT_TIMEOUT, 45L);
         curl_easy_setopt(curl_, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(curl_, CURLOPT_ACCEPT_ENCODING, ""); // Enable gzip/brotli decompression
+        if (fresh_connect) {
+            curl_easy_setopt(curl_, CURLOPT_FRESH_CONNECT, 1L);
+            curl_easy_setopt(curl_, CURLOPT_FORBID_REUSE, 1L);
+        }
         #ifdef CURLSSLOPT_NATIVE_CA
             curl_easy_setopt(curl_, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA); // Use Windows native certificate store
         #endif
@@ -460,6 +487,7 @@ private:
     CURL* curl_ = nullptr;
     curl_slist* headers_ = nullptr;
     std::string current_proxy_;
+    std::string last_error_;
 };
 
 // ============================================================================
@@ -593,6 +621,11 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
         return; // Left unmarked in DB so it can be retried on a future run
     }
 
+    if (code == -1) {
+        log_msg("[!] Network error on ID " + std::to_string(illust_id) + ": " + client.last_error() + " (skipped for now)");
+        return; // Left unmarked in DB so it can be retried on a future run
+    }
+
     if (code != 200) {
         log_msg("[!] HTTP " + std::to_string(code) + " on ID " + std::to_string(illust_id));
         return;
@@ -653,7 +686,16 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
         if (illust_type == 2) {
             std::string ugoira_url = "https://www.pixiv.net/ajax/illust/" + std::to_string(illust_id) + "/ugoira_meta";
             std::string ugoira_body;
-            if (client.get_json_with_retry(ugoira_url, ugoira_body) != 200) return;
+            long ucode = client.get_json_with_retry(ugoira_url, ugoira_body);
+            if (ucode == 429) {
+                log_msg("[!] 429 Rate Limit persisted on Ugoira meta for ID " + std::to_string(illust_id));
+                return;
+            }
+            if (ucode == -1) {
+                log_msg("[!] Network error on Ugoira meta for ID " + std::to_string(illust_id) + ": " + client.last_error());
+                return;
+            }
+            if (ucode != 200) return;
 
             auto uj = json::parse(ugoira_body);
             if (uj.value("error", true) || !uj.contains("body")) return;
@@ -670,7 +712,7 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
             fs::path gif_path = post_dir / (std::to_string(illust_id) + ".gif");
 
             if (!client.download_file(zip_url, zip_path)) {
-                log_msg("[!] Failed to download Ugoira ZIP for ID " + std::to_string(illust_id));
+                log_msg("[!] Failed to download Ugoira ZIP for ID " + std::to_string(illust_id) + " (" + client.last_error() + ")");
                 return;
             }
 
@@ -698,6 +740,10 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
             long pages_code = client.get_json_with_retry(pages_url, pages_body);
             if (pages_code == 429) {
                 log_msg("[!] 429 Rate Limit persisted on pages for ID " + std::to_string(illust_id));
+                return;
+            }
+            if (pages_code == -1) {
+                log_msg("[!] Network error on pages for ID " + std::to_string(illust_id) + ": " + client.last_error());
                 return;
             }
             if (pages_code == 200) {
@@ -736,7 +782,7 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
                 db.mark_processed(illust_id, 200);
                 log_msg("[+] ID " + std::to_string(illust_id) + " downloaded (" + dest_file.filename().string() + ")");
             } else {
-                log_msg("[!] Failed to download file for ID " + std::to_string(illust_id));
+                log_msg("[!] Failed to download file for ID " + std::to_string(illust_id) + " (" + client.last_error() + ")");
             }
         } else {
             // Multiple files: create folder named with illust_id
@@ -755,7 +801,7 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
                 db.mark_processed(illust_id, 200);
                 log_msg("[+] ID " + std::to_string(illust_id) + " downloaded (" + std::to_string(img_urls.size()) + " files in " + std::to_string(illust_id) + "/)");
             } else {
-                log_msg("[!] Failed to download all pages for ID " + std::to_string(illust_id));
+                log_msg("[!] Failed to download all pages for ID " + std::to_string(illust_id) + " (" + client.last_error() + ")");
             }
         }
     } catch (const std::exception& e) {
