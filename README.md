@@ -20,8 +20,12 @@ It features smart directory structuring, native Windows file property tag embedd
 - **Multi-threaded Worker Pool:** Uses persistent per-thread `libcurl` handles that reuse TLS sessions, DNS caches, and keep-alive HTTP connections.
 - **Resume & State Tracking (SQLite3 WAL):** Tracks processed artwork IDs (`200 OK` and `404 Not Found`) in a local SQLite database in Write-Ahead Logging (WAL) mode. Interrupted or overlapping runs skip already-processed posts instantaneously.
 - **Atomic File Writing:** Downloads directly to temporary `.part` files and atomically renames them upon completion to prevent corrupted files from incomplete downloads.
-- **Rate Limit & 429 Handling:** Automatically detects HTTP 429 (Too Many Requests), rotates proxy, sleeps for 15 seconds, and leaves the post uncommitted in the database for a future retry.
-- **Proxy Rotation:** Supports single proxy URLs or round-robin rotation from a proxy list file (`http://`, `https://`, `socks5://`, `socks5h://`).
+- **Intelligent 429 Rate Limit Mitigation:**
+  - **Cross-Thread Global Cooldown:** When a rate limit is detected on a single IP, all active threads pause synchronously (exponential backoff: 10s -> 20s -> 35s), eliminating concurrent 429 cascade storms.
+  - **Automatic In-Flight Retries:** Automatically retries posts up to 3 times with exponential backoff or instant proxy rotation instead of prematurely abandoning downloads.
+  - **Anti-Burst Jitter:** Introduces randomized delay variance (±25%) so worker threads do not fire in lockstep bursts.
+  - **Modern Browser Fingerprinting:** Emulates standard desktop Chrome headers (`sec-ch-ua`, `Sec-Fetch-*`, `Accept-Language`, etc.) to minimize WAF/Cloudflare bot flags.
+- **Proxy Rotation & `noproxy` Direct Mode:** Supports single proxy URLs (`-p` / `proxy`) or round-robin rotation from a proxy list file (`--proxy-file`). You can include `noproxy` or `direct` entries in `proxies.txt` to seamlessly mix direct connections with proxy pools.
 - **Flexible Configuration:** Automatically loads settings from `config.cfg` by default, while allowing CLI arguments to override any parameter.
 - **Self-Contained Builds:** Generates completely standalone binaries on Windows with zero external DLL dependencies (statically linked C runtime, SQLite3, libzip, and native Windows Schannel TLS).
 
@@ -162,13 +166,54 @@ session = YOUR_PHPSESSID_HERE
 ai = true
 
 # Concurrency and Rate Limiting
-threads = 4
-delay = 500
+# Recommended for direct connection (no proxy): threads = 3, delay = 600
+# Recommended with multi-proxy list: threads = 8..16, delay = 200..300
+threads = 3
+delay = 600
 
 # Proxy Configuration (optional)
+# Supports http://, https://, socks5://, socks5h://
+# Set 'noproxy' or 'direct' to bypass proxies for that slot
 # proxy = socks5h://127.0.0.1:1080
 # proxy-file = ./proxies.txt
 ```
+
+### Proxy Configuration & `noproxy` Support
+
+The scraper supports single proxy routing or rotating through a list of proxies:
+
+- **Single Proxy:** Specify in `config.cfg` (`proxy = ...`) or via CLI (`-p socks5h://127.0.0.1:1080`).
+- **Proxy List:** Provide a text file with one proxy per line via `proxy-file = proxies.txt` or `--proxy-file proxies.txt`.
+- **`noproxy` / Direct Mode in Proxy Lists:** You can specify `noproxy`, `direct`, or `none` as an entry in `proxies.txt` to alternate between proxies and direct connections:
+
+```text
+# proxies.txt example
+http://proxy1.example.com:8080
+noproxy
+socks5://proxy2.example.com:1080
+direct
+```
+
+In this mode, the worker pool alternates requests round-robin between `proxy1`, your direct local connection, `proxy2`, and your direct local connection.
+
+---
+
+## Mitigating HTTP 429 (Too Many Requests)
+
+Pixiv limits single-IP requests to approximately **2–4 requests per second**. If you exceed this rate, Pixiv responds with `HTTP 429 Too Many Requests`.
+
+Pixiv Downloader implements four layers of rate-limit protection:
+
+1. **Synchronized Global Cooldown:** If a 429 occurs on a direct connection or single proxy, all worker threads pause synchronously (exponential backoff: 10s -> 20s -> 35s), preventing simultaneous thread collisions.
+2. **In-Flight Retries:** Instead of discarding the artwork on 429, the worker pauses (or rotates proxy) and retries up to 3 times automatically.
+3. **Randomized Delay Jitter:** Adds ±25% random variance to `delay_ms` per thread to avoid lockstep request bursts.
+4. **Modern Browser Fingerprint:** Sends realistic desktop Chrome headers and Client Hints (`sec-ch-ua`, `Sec-Fetch-*`, `Accept-Language`).
+
+### Recommended Settings:
+- **Direct Connection (Default):** `threads = 3`, `delay = 600` (safe ~2-3 req/s without triggering 429).
+- **With a Rotating Proxy Pool:** `threads = 8..16`, `delay = 200..300` (load is distributed across distinct IPs).
+
+---
 
 ### How to Obtain `PHPSESSID`
 
@@ -205,7 +250,7 @@ Keep default settings (output directory, session, threads) in `config.cfg`, but 
 ### 3. Full CLI usage (without `config.cfg`)
 
 ```bash
-./build/pixiv_scrapper 232400 232500 -o ./downloads -t 8 -d 300 -s "YOUR_PHPSESSID" --proxy-file proxies.txt --ai=false
+./build/pixiv_scrapper 232400 232500 -o ./downloads -t 3 -d 600 -s "YOUR_PHPSESSID" --proxy-file proxies.txt --ai=false
 ```
 
 ---
@@ -227,10 +272,10 @@ Options:
   --end INT:POSITIVE          End artwork ID (inclusive)
   -o,--output TEXT REQUIRED   Output directory path
   -s,--session TEXT           Pixiv PHPSESSID cookie (for R-18 access and higher rate limits)
-  -t,--threads INT [4]        Number of worker threads
-  -d,--delay INT [500]        Delay between requests per thread in ms
-  -p,--proxy TEXT             Single proxy URL (e.g. socks5h://127.0.0.1:1080)
-  --proxy-file TEXT           Path to text file with proxy list (one per line)
+  -t,--threads INT [3]        Number of worker threads
+  -d,--delay INT [600]        Delay between requests per thread in ms
+  -p,--proxy TEXT             Single proxy URL (e.g. socks5h://127.0.0.1:1080 or noproxy)
+  --proxy-file TEXT           Path to text file with proxy list (supports noproxy)
   --db TEXT [pixiv_state.db]  Path to SQLite state database
   --ai BOOL [true]            Allow downloading AI-generated works (true/false)
 ```

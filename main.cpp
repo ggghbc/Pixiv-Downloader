@@ -1,9 +1,12 @@
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -44,6 +47,37 @@ void log_msg(const std::string& msg) {
 }
 
 // ============================================================================
+// Global Cross-Thread Cooldown Tracker (for synchronized 429 rate limit backoff)
+// ============================================================================
+std::atomic<int64_t> g_cooldown_until_ms{0};
+
+void trigger_global_cooldown(int seconds, const std::string& reason) {
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    int64_t target_ms = now_ms + (static_cast<int64_t>(seconds) * 1000);
+
+    int64_t current = g_cooldown_until_ms.load(std::memory_order_relaxed);
+    while (target_ms > current) {
+        if (g_cooldown_until_ms.compare_exchange_weak(current, target_ms)) {
+            log_msg("[!] " + reason + " - all threads cooling down for " + std::to_string(seconds) + "s...");
+            break;
+        }
+    }
+}
+
+void wait_if_in_cooldown() {
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    int64_t until = g_cooldown_until_ms.load(std::memory_order_relaxed);
+    if (until > now_ms) {
+        int64_t sleep_time = until - now_ms;
+        if (sleep_time > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
+        }
+    }
+}
+
+// ============================================================================
 // Application Configuration
 // ============================================================================
 struct Config {
@@ -52,8 +86,8 @@ struct Config {
     fs::path output_dir;
     fs::path db_path = "pixiv_state.db";
     std::string session_id;
-    int threads = 4;
-    int delay_ms = 500;
+    int threads = 3;
+    int delay_ms = 600;
     bool allow_ai = true;
 };
 
@@ -121,13 +155,13 @@ private:
 };
 
 // ============================================================================
-// Thread-Safe Round-Robin Proxy Pool
+// Thread-Safe Round-Robin Proxy Pool (supports noproxy/direct alongside proxies)
 // ============================================================================
 class ProxyPool {
 public:
     ProxyPool(const std::string& single_proxy, const std::string& proxy_file) {
         if (!single_proxy.empty()) {
-            proxies_.push_back(single_proxy);
+            add_entry(single_proxy);
         }
         if (!proxy_file.empty()) {
             std::ifstream in(proxy_file);
@@ -135,9 +169,34 @@ public:
             while (std::getline(in, line)) {
                 auto first = line.find_first_not_of(" \t\r\n");
                 if (first == std::string::npos || line[first] == '#') continue;
-                line = line.substr(first, line.find_last_not_of(" \t\r\n") - first + 1);
-                if (!line.empty()) proxies_.push_back(line);
+                auto last = line.find_last_not_of(" \t\r\n");
+                line = line.substr(first, last - first + 1);
+                if (!line.empty()) {
+                    add_entry(line);
+                }
             }
+        }
+    }
+
+    static std::string normalize_proxy(std::string str) {
+        auto first = str.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return "";
+        auto last = str.find_last_not_of(" \t\r\n");
+        str = str.substr(first, last - first + 1);
+
+        std::string lower = str;
+        for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        if (lower == "noproxy" || lower == "no_proxy" || lower == "direct" || lower == "none") {
+            return "noproxy";
+        }
+        return str;
+    }
+
+    void add_entry(const std::string& raw) {
+        std::string norm = normalize_proxy(raw);
+        if (!norm.empty()) {
+            proxies_.push_back(norm);
         }
     }
 
@@ -148,6 +207,14 @@ public:
 
     bool empty() const { return proxies_.empty(); }
     size_t size() const { return proxies_.size(); }
+
+    size_t count_noproxy() const {
+        size_t cnt = 0;
+        for (const auto& p : proxies_) {
+            if (p == "noproxy") ++cnt;
+        }
+        return cnt;
+    }
 
 private:
     std::vector<std::string> proxies_;
@@ -230,10 +297,17 @@ class WorkerClient {
 public:
     WorkerClient(const Config& cfg, ProxyPool& proxies) : cfg_(cfg), proxies_(proxies) {
         curl_ = curl_easy_init();
-        // Pixiv requires a valid User-Agent and Referer header to serve image files
-        headers_ = curl_slist_append(headers_, "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36");
+        // Realistic modern browser headers to minimize Cloudflare / Pixiv WAF rate limit triggers
+        headers_ = curl_slist_append(headers_, "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
         headers_ = curl_slist_append(headers_, "Referer: https://www.pixiv.net/");
-        headers_ = curl_slist_append(headers_, "Accept: application/json");
+        headers_ = curl_slist_append(headers_, "Accept: application/json, text/plain, */*");
+        headers_ = curl_slist_append(headers_, "Accept-Language: en-US,en;q=0.9,ja;q=0.8");
+        headers_ = curl_slist_append(headers_, "sec-ch-ua: \"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"");
+        headers_ = curl_slist_append(headers_, "sec-ch-ua-mobile: ?0");
+        headers_ = curl_slist_append(headers_, "sec-ch-ua-platform: \"Windows\"");
+        headers_ = curl_slist_append(headers_, "Sec-Fetch-Dest: empty");
+        headers_ = curl_slist_append(headers_, "Sec-Fetch-Mode: cors");
+        headers_ = curl_slist_append(headers_, "Sec-Fetch-Site: same-origin");
         current_proxy_ = proxies_.next();
     }
 
@@ -261,7 +335,38 @@ public:
         return http_code;
     }
 
-    bool download_file(const std::string& url, const fs::path& dest_path) {
+    long get_json_with_retry(const std::string& url, std::string& response_body, int max_retries = 3) {
+        long last_http_code = -1;
+        for (int attempt = 0; attempt <= max_retries; ++attempt) {
+            wait_if_in_cooldown();
+
+            last_http_code = get_json(url, response_body);
+
+            if (last_http_code == 200 || last_http_code == 404) {
+                return last_http_code;
+            }
+
+            if (last_http_code == 429) {
+                if (proxies_.size() > 1 && attempt < 2) {
+                    rotate_proxy();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(400 * (attempt + 1)));
+                } else {
+                    int cool = (attempt == 0 ? 10 : (attempt == 1 ? 20 : 35));
+                    trigger_global_cooldown(cool, "429 Rate Limit");
+                    wait_if_in_cooldown();
+                }
+                continue;
+            }
+
+            if (attempt < max_retries) {
+                rotate_proxy();
+                std::this_thread::sleep_for(std::chrono::milliseconds(500 * (attempt + 1)));
+            }
+        }
+        return last_http_code;
+    }
+
+    bool download_file(const std::string& url, const fs::path& dest_path, int max_retries = 3) {
         // Skip download if file already exists and is non-empty
         if (fs::exists(dest_path) && fs::file_size(dest_path) > 0) return true;
 
@@ -269,30 +374,50 @@ public:
         fs::path temp_path = dest_path;
         temp_path += ".part";
 
-        FILE* fp = fopen(temp_path.string().c_str(), "wb");
-        if (!fp) return false;
+        for (int attempt = 0; attempt <= max_retries; ++attempt) {
+            wait_if_in_cooldown();
 
-        setup_request(url);
-        curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, write_file_cb);
-        curl_easy_setopt(curl_, CURLOPT_WRITEDATA, fp);
+            FILE* fp = fopen(temp_path.string().c_str(), "wb");
+            if (!fp) return false;
 
-        CURLcode res = curl_easy_perform(curl_);
-        fclose(fp);
+            setup_request(url);
+            curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, write_file_cb);
+            curl_easy_setopt(curl_, CURLOPT_WRITEDATA, fp);
 
-        long http_code = 0;
-        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &http_code);
+            CURLcode res = curl_easy_perform(curl_);
+            fclose(fp);
 
-        if (res != CURLE_OK || http_code != 200) {
+            long http_code = 0;
+            curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &http_code);
+
+            if (res == CURLE_OK && http_code == 200) {
+                std::error_code ec;
+                fs::rename(temp_path, dest_path, ec);
+                return !ec;
+            }
+
             std::error_code ec;
             fs::remove(temp_path, ec);
-            rotate_proxy();
-            return false;
+
+            if (http_code == 429) {
+                if (proxies_.size() > 1 && attempt < 2) {
+                    rotate_proxy();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(400 * (attempt + 1)));
+                } else {
+                    int cool = (attempt == 0 ? 10 : (attempt == 1 ? 20 : 35));
+                    trigger_global_cooldown(cool, "429 Rate Limit on image download");
+                    wait_if_in_cooldown();
+                }
+                continue;
+            }
+
+            if (attempt < max_retries) {
+                rotate_proxy();
+                std::this_thread::sleep_for(std::chrono::milliseconds(500 * (attempt + 1)));
+            }
         }
 
-        // Atomic rename from .part to final filename
-        std::error_code ec;
-        fs::rename(temp_path, dest_path, ec);
-        return !ec;
+        return false;
     }
 
 private:
@@ -314,8 +439,10 @@ private:
             std::string cookie = "PHPSESSID=" + cfg_.session_id;
             curl_easy_setopt(curl_, CURLOPT_COOKIE, cookie.c_str());
         }
-        if (!current_proxy_.empty()) {
+        if (!current_proxy_.empty() && current_proxy_ != "noproxy") {
             curl_easy_setopt(curl_, CURLOPT_PROXY, current_proxy_.c_str());
+        } else {
+            curl_easy_setopt(curl_, CURLOPT_PROXY, "");
         }
     }
 
@@ -454,7 +581,7 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
 
     std::string info_url = "https://www.pixiv.net/ajax/illust/" + std::to_string(illust_id);
     std::string body;
-    long code = client.get_json(info_url, body);
+    long code = client.get_json_with_retry(info_url, body);
 
     if (code == 404) {
         db.mark_processed(illust_id, 404);
@@ -462,9 +589,7 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
     }
 
     if (code == 429) {
-        log_msg("[!] 429 Rate Limit on ID " + std::to_string(illust_id) + " - rotating proxy and sleeping 15s...");
-        client.rotate_proxy();
-        std::this_thread::sleep_for(std::chrono::seconds(15));
+        log_msg("[!] 429 Rate Limit persisted for ID " + std::to_string(illust_id) + " (skipped for now)");
         return; // Left unmarked in DB so it can be retried on a future run
     }
 
@@ -528,7 +653,7 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
         if (illust_type == 2) {
             std::string ugoira_url = "https://www.pixiv.net/ajax/illust/" + std::to_string(illust_id) + "/ugoira_meta";
             std::string ugoira_body;
-            if (client.get_json(ugoira_url, ugoira_body) != 200) return;
+            if (client.get_json_with_retry(ugoira_url, ugoira_body) != 200) return;
 
             auto uj = json::parse(ugoira_body);
             if (uj.value("error", true) || !uj.contains("body")) return;
@@ -570,11 +695,9 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
         } else {
             std::string pages_url = "https://www.pixiv.net/ajax/illust/" + std::to_string(illust_id) + "/pages";
             std::string pages_body;
-            long pages_code = client.get_json(pages_url, pages_body);
+            long pages_code = client.get_json_with_retry(pages_url, pages_body);
             if (pages_code == 429) {
-                log_msg("[!] 429 Rate Limit on ID " + std::to_string(illust_id) + " - rotating proxy and sleeping 15s...");
-                client.rotate_proxy();
-                std::this_thread::sleep_for(std::chrono::seconds(15));
+                log_msg("[!] 429 Rate Limit persisted on pages for ID " + std::to_string(illust_id));
                 return;
             }
             if (pages_code == 200) {
@@ -659,10 +782,10 @@ int main(int argc, char** argv) {
         ->required()->check(CLI::PositiveNumber);
     app.add_option("-o,--output", cfg.output_dir, "Output directory path")->required();
     app.add_option("-s,--session", cfg.session_id, "Pixiv PHPSESSID cookie (for R-18 access and higher rate limits)");
-    app.add_option("-t,--threads", cfg.threads, "Number of worker threads")->default_val(4);
-    app.add_option("-d,--delay", cfg.delay_ms, "Delay between requests per thread in ms")->default_val(500);
-    app.add_option("-p,--proxy", single_proxy, "Single proxy URL (e.g. socks5h://127.0.0.1:1080)");
-    app.add_option("--proxy-file", proxy_file, "Path to text file with proxy list (one per line)");
+    app.add_option("-t,--threads", cfg.threads, "Number of worker threads")->default_val(3);
+    app.add_option("-d,--delay", cfg.delay_ms, "Delay between requests per thread in ms")->default_val(600);
+    app.add_option("-p,--proxy", single_proxy, "Single proxy URL (e.g. socks5h://127.0.0.1:1080 or noproxy)");
+    app.add_option("--proxy-file", proxy_file, "Path to text file with proxy list (one per line, supports noproxy)");
     app.add_option("--db", cfg.db_path, "Path to SQLite state database")->default_val("pixiv_state.db");
     app.add_option("--ai,--ai-work,--ai-art", cfg.allow_ai, "Allow downloading AI-generated works (true/false)")->default_val(true);
 
@@ -682,27 +805,46 @@ int main(int argc, char** argv) {
         std::atomic<int64_t> next_id{cfg.start_id};
         std::vector<std::thread> workers;
 
+        std::string proxy_info;
+        if (proxies.empty()) {
+            proxy_info = "none (direct connection)";
+        } else {
+            size_t no_p = proxies.count_noproxy();
+            size_t total = proxies.size();
+            if (no_p > 0) {
+                proxy_info = std::to_string(total) + " loaded (" + std::to_string(total - no_p) + " proxies, " + std::to_string(no_p) + " direct/noproxy)";
+            } else {
+                proxy_info = std::to_string(total) + " loaded";
+            }
+        }
+
         std::cout << "[*] Range:   " << cfg.start_id << ".." << cfg.end_id << "\n"
                   << "[*] Output:  " << cfg.output_dir.string() << "\n"
-                  << "[*] Threads: " << cfg.threads << " (delay " << cfg.delay_ms << " ms)\n"
+                  << "[*] Threads: " << cfg.threads << " (delay ~" << cfg.delay_ms << " ms with jitter)\n"
                   << "[*] AI Art:  " << (cfg.allow_ai ? "allowed (download AI works)" : "blocked (skip AI works)") << "\n"
                   << "[*] Session: " << (cfg.session_id.empty() ? "none (public works only)" : "authenticated (PHPSESSID)") << "\n"
-                  << "[*] Proxies: " << (proxies.empty() ? "none (direct connection)" : std::to_string(proxies.size()) + " loaded") << "\n\n";
+                  << "[*] Proxies: " << proxy_info << "\n\n";
 
         for (int i = 0; i < cfg.threads; ++i) {
-            workers.emplace_back([&]() {
+            workers.emplace_back([&, i]() {
 #ifdef _WIN32
                 CoInitializeEx(NULL, COINIT_MULTITHREADED);
 #endif
+                std::mt19937 rng(static_cast<unsigned int>(std::chrono::system_clock::now().time_since_epoch().count() + i * 997));
                 WorkerClient client(cfg, proxies);
                 while (true) {
+                    wait_if_in_cooldown();
+
                     int64_t id = next_id.fetch_add(1, std::memory_order_relaxed);
                     if (id > cfg.end_id) break;
 
                     process_illust(id, client, db, cfg);
 
                     if (cfg.delay_ms > 0) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(cfg.delay_ms));
+                        int jitter_range = std::max(1, cfg.delay_ms / 4);
+                        std::uniform_int_distribution<int> dist(-jitter_range, jitter_range);
+                        int actual_delay = std::max(50, cfg.delay_ms + dist(rng));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(actual_delay));
                     }
                 }
 #ifdef _WIN32
