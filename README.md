@@ -1,6 +1,6 @@
-# Pixiv Range Scraper
+# Pixiv Downloader
 
-A high-performance, multi-threaded C++17 CLI tool for downloading artworks from [Pixiv](https://www.pixiv.net/) by artwork ID range. It downloads original-resolution images (`img-original`), multi-page manga/galleries, and animated **Ugoira** works (saved as both the original frame `.zip` archive and an in-memory compiled animated `.gif`).
+A high-performance, multi-threaded C++17 CLI tool for downloading artworks from [Pixiv](https://www.pixiv.net/) by artwork ID range. It downloads original-resolution images, multi-page manga/galleries, and animated **Ugoira** works (saved as both the original frame `.zip` archive and an in-memory compiled animated `.gif`).
 
 It features smart directory structuring, native Windows file property tag embedding, atomic writes, SQLite-based state tracking with resume support, and round-robin proxy rotation.
 
@@ -14,7 +14,6 @@ It features smart directory structuring, native Windows file property tag embedd
   - **Multi-file posts (manga / illustration sets):** Automatically organized into a dedicated subfolder named after the artwork ID (`<output_dir>/<illust_id>/`).
 - **Native File Metadata & Tag Embedding:**
   - Automatically parses artwork tags (both Japanese tags and English translations) and artwork titles directly from Pixiv metadata.
-  - On Windows, tags are embedded natively into the file's system properties (`PKEY_Keywords` / "Tags" and `PKEY_Title` / "Title") via the Windows Shell Property Store without altering image quality.
   - Tags are immediately visible in Windows File Explorer (under the *Tags* column and in *Properties -> Details*) and are indexed for instant search queries (e.g. `tag:original`).
 - **AI-Generated Work Filter:** Built-in filter detecting posts marked by creators as **AI-generated work** (Pixiv's official `aiType == 2` attribute, along with AI tags). Configure `ai = false` to automatically skip AI posts.
 - **Full Ugoira Support:** Automatically detects animated works, downloads the original frame `.zip` archive, and compiles an animated `.gif` in memory with exact per-frame millisecond delays.
@@ -25,17 +24,6 @@ It features smart directory structuring, native Windows file property tag embedd
 - **Proxy Rotation:** Supports single proxy URLs or round-robin rotation from a proxy list file (`http://`, `https://`, `socks5://`, `socks5h://`).
 - **Flexible Configuration:** Automatically loads settings from `config.cfg` by default, while allowing CLI arguments to override any parameter.
 - **Self-Contained Builds:** Generates completely standalone binaries on Windows with zero external DLL dependencies (statically linked C runtime, SQLite3, libzip, and native Windows Schannel TLS).
-
----
-
-## Pre-built Binaries
-
-Ready-to-use binaries are available in the `dist/` directory:
-
-| Platform | Path | Description |
-|---|---|---|
-| **Windows (x64)** | `dist/windows-x64/pixiv_scrapper.exe` | Standalone portable `.exe` (~4.0 MB, statically linked, no external DLLs needed) |
-| **Linux (x64)** | `dist/linux-x64/pixiv_scrapper` | ELF 64-bit executable (~600 KB) |
 
 ---
 
@@ -87,8 +75,6 @@ The project depends on:
 - `nlohmann/json` (JSON parser)
 - `stb_image.h` & `gif.h` (Image decoding and GIF generation)
 
-> **Zero-Config Fallback:** If any of these libraries are not found in your system or package manager, CMake's `FetchContent` **automatically downloads and builds them statically from source**. You do not need to manually install dependencies on Windows!
-
 ---
 
 ## Building from Source
@@ -102,7 +88,7 @@ This produces a 100% portable, statically linked `.exe` using Windows Schannel (
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 
-# Optional: strip debug symbols to reduce binary size (~4 MB)
+# Optional: strip debug symbols to reduce binary size
 strip -s build/pixiv_scrapper.exe
 ```
 
