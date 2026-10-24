@@ -16,6 +16,7 @@ It features smart directory structuring, native Windows file property tag embedd
   - Automatically parses artwork tags (both Japanese tags and English translations) and artwork titles directly from Pixiv metadata.
   - On Windows, tags are embedded natively into the file's system properties (`PKEY_Keywords` / "Tags" and `PKEY_Title` / "Title") via the Windows Shell Property Store without altering image quality.
   - Tags are immediately visible in Windows File Explorer (under the *Tags* column and in *Properties -> Details*) and are indexed for instant search queries (e.g. `tag:original`).
+- **AI-Generated Work Filter:** Built-in filter detecting posts marked by creators as **AI-generated work** (Pixiv's official `aiType == 2` attribute, along with AI tags). Configure `ai = false` to automatically skip AI posts.
 - **Full Ugoira Support:** Automatically detects animated works, downloads the original frame `.zip` archive, and compiles an animated `.gif` in memory with exact per-frame millisecond delays.
 - **Multi-threaded Worker Pool:** Uses persistent per-thread `libcurl` handles that reuse TLS sessions, DNS caches, and keep-alive HTTP connections.
 - **Resume & State Tracking (SQLite3 WAL):** Tracks processed artwork IDs (`200 OK` and `404 Not Found`) in a local SQLite database in Write-Ahead Logging (WAL) mode. Interrupted or overlapping runs skip already-processed posts instantaneously.
@@ -171,6 +172,9 @@ db = ./pixiv_state.db
 # Pixiv PHPSESSID cookie (optional, required for R-18 works and higher rate limits)
 session = YOUR_PHPSESSID_HERE
 
+# AI-generated artwork filter (true = download AI works, false = skip AI works)
+ai = true
+
 # Concurrency and Rate Limiting
 threads = 4
 delay = 500
@@ -215,7 +219,7 @@ Keep default settings (output directory, session, threads) in `config.cfg`, but 
 ### 3. Full CLI usage (without `config.cfg`)
 
 ```bash
-./build/pixiv_scrapper 232400 232500 -o ./downloads -t 8 -d 300 -s "YOUR_PHPSESSID" --proxy-file proxies.txt
+./build/pixiv_scrapper 232400 232500 -o ./downloads -t 8 -d 300 -s "YOUR_PHPSESSID" --proxy-file proxies.txt --ai=false
 ```
 
 ---
@@ -242,6 +246,7 @@ Options:
   -p,--proxy TEXT             Single proxy URL (e.g. socks5h://127.0.0.1:1080)
   --proxy-file TEXT           Path to text file with proxy list (one per line)
   --db TEXT [pixiv_state.db]  Path to SQLite state database
+  --ai BOOL [true]            Allow downloading AI-generated works (true/false)
 ```
 
 ---
@@ -258,7 +263,7 @@ CREATE TABLE processed_posts (
 );
 ```
 
-- When restarting or scanning overlapping ranges, completed artworks and deleted/non-existent IDs (`404`) are skipped instantly without network requests.
+- When restarting or scanning overlapping ranges, completed artworks, skipped AI works, and deleted/non-existent IDs (`404`) are skipped instantly without network requests.
 - Rate-limited artworks (`429`) and restricted R-18 works without a session cookie are intentionally not recorded so they can be retried on subsequent runs.
 
 ---

@@ -54,6 +54,7 @@ struct Config {
     std::string session_id;
     int threads = 4;
     int delay_ms = 500;
+    bool allow_ai = true;
 };
 
 // ============================================================================
@@ -473,6 +474,23 @@ void process_illust(int64_t illust_id, WorkerClient& client, StateDB& db, const 
             }
         }
 
+        // Check for AI-generated artwork (Pixiv setting: aiType == 2, or AI tags)
+        bool is_ai = (b.value("aiType", 0) == 2);
+        if (!is_ai) {
+            for (const auto& tag : tags) {
+                if (tag == "AI生成" || tag == "AIイラスト" || tag == "NovelAI" || tag == "AI-generated") {
+                    is_ai = true;
+                    break;
+                }
+            }
+        }
+
+        if (!cfg.allow_ai && is_ai) {
+            db.mark_processed(illust_id, 200);
+            log_msg("[-] ID " + std::to_string(illust_id) + " skipped (AI-generated work)");
+            return;
+        }
+
         // Detect Ugoira (animated post: illustType == 2)
         if (illust_type == 2) {
             std::string ugoira_url = "https://www.pixiv.net/ajax/illust/" + std::to_string(illust_id) + "/ugoira_meta";
@@ -613,6 +631,7 @@ int main(int argc, char** argv) {
     app.add_option("-p,--proxy", single_proxy, "Single proxy URL (e.g. socks5h://127.0.0.1:1080)");
     app.add_option("--proxy-file", proxy_file, "Path to text file with proxy list (one per line)");
     app.add_option("--db", cfg.db_path, "Path to SQLite state database")->default_val("pixiv_state.db");
+    app.add_option("--ai,--ai-work,--ai-art", cfg.allow_ai, "Allow downloading AI-generated works (true/false)")->default_val(true);
 
     CLI11_PARSE(app, argc, argv);
 
@@ -633,6 +652,7 @@ int main(int argc, char** argv) {
         std::cout << "[*] Range:   " << cfg.start_id << ".." << cfg.end_id << "\n"
                   << "[*] Output:  " << cfg.output_dir.string() << "\n"
                   << "[*] Threads: " << cfg.threads << " (delay " << cfg.delay_ms << " ms)\n"
+                  << "[*] AI Art:  " << (cfg.allow_ai ? "allowed (download AI works)" : "blocked (skip AI works)") << "\n"
                   << "[*] Session: " << (cfg.session_id.empty() ? "none (public works only)" : "authenticated (PHPSESSID)") << "\n"
                   << "[*] Proxies: " << (proxies.empty() ? "none (direct connection)" : std::to_string(proxies.size()) + " loaded") << "\n\n";
 
